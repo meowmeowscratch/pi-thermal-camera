@@ -2,6 +2,7 @@ meow-sdk
 python-dotenv
 RPi.GPIO
 adafruit-circuitpython-amg88xx
+glowbit
 luma.oled
 Pillow
 numpy

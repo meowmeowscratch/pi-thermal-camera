@@ -1,10 +1,11 @@
 # Pi Thermal Camera
 
-Read temperature data from an AMG8833 infrared sensor and stream it to meow meow scratch. Each frame includes the raw 8x8 temperature grid and an 8-bit version ready for machine learning models. If you have a 1.3" OLED screen it shows a live heat map; otherwise it prints an ASCII heat map in the terminal.
+Turn your Raspberry Pi into a thermal camera! This project reads an 8x8 grid of temperature data from an AMG8833 infrared sensor and displays a live colour heat map on a GlowBit 8x8 LED matrix — blue for cold, red for hot. Each frame is also streamed to meow meow scratch with an 8-bit version ready for machine learning models.
 
 ## What you'll learn
 - How I2C communication works (two devices sharing the same two wires)
 - Reading temperature data from an infrared sensor
+- Driving a WS2812B LED matrix with colour-mapped data
 - Sending sensor data to an API for storage and analysis
 - Mapping temperature values to 8-bit integers for ML model input
 
@@ -12,9 +13,11 @@ Read temperature data from an AMG8833 infrared sensor and stream it to meow meow
 
 ### Hardware
 - **Raspberry Pi Zero W** (or any Pi with GPIO pins)
-- **AMG8833 thermal sensor** — a small board with an 8x8 grid of infrared thermometers. Each one measures the temperature of whatever it's pointed at, giving you 64 temperature readings at once.
-- **1.3" OLED display** *(optional)* (Duinotech v2.0 or similar SH1106-based OLED) — a tiny screen that shows crisp white graphics on a black background. If you don't have one, the script prints an ASCII heat map to the terminal instead.
+- **AMG8833 thermal sensor** — a small board with an 8x8 grid of infrared thermometers. Each one measures the temperature of whatever it's pointed at, giving you 64 temperature readings at once. Detects 0–80°C at up to ~7 metres.
+- **GlowBit Matrix 8x8** (Core Electronics) — an 8x8 grid of individually addressable RGB LEDs (WS2812B). Each LED can display any colour, so it maps perfectly to the 8x8 sensor grid. Uses a single data wire.
+- **1.3" OLED display** *(optional)* (Duinotech v2.0 or similar SH1106-based OLED) — a tiny monochrome screen. If connected, it shows a smooth greyscale heat map alongside temperature stats.
 - **Jumper wires** — short cables that connect components together without soldering.
+- **Breadboard** *(optional)* — handy for splitting shared I2C pins out to multiple devices.
 
 ### Software
 - Python 3 (comes pre-installed on your Pi)
@@ -22,27 +25,52 @@ Read temperature data from an AMG8833 infrared sensor and stream it to meow meow
 
 ## Wiring diagram
 
-Both the sensor and the display use **I2C** (pronounced "eye-squared-see"), a communication protocol that only needs two data wires. Because each device has its own unique address, they can share the same wires.
-
-> **No OLED?** Just wire the AMG8833 sensor (VIN, GND, SDA, SCL) and skip the display — the script will automatically fall back to terminal output.
+The AMG8833 sensor uses **I2C** (pronounced "eye-squared-see"), a two-wire protocol. The GlowBit matrix uses a single **data pin** (GPIO 18). They don't share any wires.
 
 ```
-Raspberry Pi            AMG8833 Sensor        OLED Display (optional)
-──────────────          ──────────────        ──────────────
-Pin 1  (3.3V) ────────── VIN ──────────────── VCC
-Pin 6  (GND)  ────────── GND ──────────────── GND
-Pin 3  (SDA)  ────────── SDA ──────────────── SDA
-Pin 5  (SCL)  ────────── SCL ──────────────── SCL
+Raspberry Pi            AMG8833 Sensor
+──────────────          ──────────────
+Pin 1  (3.3V) ────────── VIN
+Pin 6  (GND)  ────────── GND
+Pin 3  (SDA)  ────────── SDA
+Pin 5  (SCL)  ────────── SCL
+
+Raspberry Pi            GlowBit Matrix 8x8
+──────────────          ───────────────────
+Pin 2  (5V)   ────────── 5V
+Pin 14 (GND)  ────────── GND
+Pin 12 (GPIO 18) ─────── DIN
 ```
 
-| Component pin | Raspberry Pi pin | What it does |
+### AMG8833 sensor wiring
+
+| AMG8833 pin | Raspberry Pi pin | What it does |
 |---|---|---|
-| VIN / VCC | Pin 1 (3.3V Power) | Provides power to the component |
-| GND | Pin 6 (Ground) | Completes the electrical circuit |
-| SDA | Pin 3 (GPIO 2 / SDA) | Carries the data for I2C communication |
-| SCL | Pin 5 (GPIO 3 / SCL) | Carries the clock signal that keeps I2C in sync |
+| VIN | Pin 1 (3.3V Power) | Powers the sensor |
+| GND | Pin 6 (Ground) | Completes the circuit |
+| SDA | Pin 3 (GPIO 2 / SDA) | I2C data line |
+| SCL | Pin 5 (GPIO 3 / SCL) | I2C clock line |
 
-> **Tip:** Both devices connect to the *same* four Pi pins. You can use a small breadboard to split each pin out to both devices, or daisy-chain the wires.
+### GlowBit matrix wiring
+
+| GlowBit pin | Raspberry Pi pin | What it does |
+|---|---|---|
+| 5V | Pin 2 (5V Power) | Powers the LEDs — use 5V, not 3.3V |
+| GND | Pin 14 (Ground) | Completes the circuit |
+| DIN | Pin 12 (GPIO 18) | Receives colour data for the LEDs |
+
+> **Important:** Power the GlowBit from the Pi's **5V** pin (pin 2 or 4), not 3.3V. The LEDs need 5V to display colours correctly. Make sure the data wire goes to **DIN** (data in), not DOUT (data out).
+
+### Optional OLED wiring
+
+If you also have a 1.3" OLED, connect it to the same I2C bus as the sensor:
+
+| OLED pin | Raspberry Pi pin |
+|---|---|
+| VCC | Pin 1 (3.3V) |
+| GND | Pin 6 (GND) |
+| SDA | Pin 3 (SDA) |
+| SCL | Pin 5 (SCL) |
 
 ## Step-by-step setup
 
@@ -69,11 +97,18 @@ i2cdetect -y 1
 
 You should see **0x69** (the AMG8833). If you also have the OLED connected, you'll see **0x3c** too. If an expected address is missing, double-check your wiring.
 
-### 2. Install the required libraries
-
-`pip` is Python's package installer — it downloads libraries from the internet and sets them up for you.
+### 2. Install system dependencies
 
 ```bash
+sudo apt install -y libopenblas0 fonts-dejavu
+```
+
+### 3. Set up the project
+
+```bash
+cd ~/projects/pi-thermal-camera
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -85,23 +120,18 @@ This installs:
 | `python-dotenv` | Loads your API key from the `.env` file |
 | `RPi.GPIO` | Low-level access to the Pi's GPIO pins |
 | `adafruit-circuitpython-amg88xx` | Reads temperature data from the AMG8833 sensor |
+| `glowbit` | Core Electronics driver for the GlowBit LED matrix |
 | `luma.oled` | Draws graphics on the OLED screen (optional) |
 | `Pillow` | Creates and manipulates images in Python |
 | `numpy` | Fast number crunching for the temperature grid |
 
-You may also need to install a system library and font:
-
-```bash
-sudo apt install -y libopenblas0 fonts-dejavu
-```
-
-### 3. Get your API key
+### 4. Get your API key
 
 1. Go to **meowmeowscratch.com** and create a free account (or log in).
 2. Open your account settings and find your **API key** — a long string of letters and numbers that proves it's really you.
-3. Copy the key — you'll need it in the next step.
+3. Copy the key.
 
-### 4. Set your API key
+### 5. Set your API key
 
 Create a file called `.env` in the project folder. This keeps your key out of your code and out of git (it's in `.gitignore`).
 
@@ -111,26 +141,55 @@ echo 'MEOW_API_KEY=paste-your-key-here' >> .env
 
 The script uses `python-dotenv` to read this file automatically when it starts.
 
-### 5. Create your app on meow meow scratch
+### 6. Create your app on meow meow scratch
 
 1. Log in to **meowmeowscratch.com**.
 2. Create a new app called **heat**.
 
 The script will automatically create the **thermal** collection endpoint and its fields on first run — you don't need to set those up manually.
 
-### 6. Run it
+### 7. Run it
 
-Point the sensor at something (your hand, a cup of tea, a window) and start the script:
+The GlowBit needs hardware PWM access, so you must run with `sudo`:
 
 ```bash
-python3 thermal_camera.py
+sudo venv/bin/python3 thermal_camera.py
 ```
 
-You'll see a heat map update in the terminal (or on the OLED if connected), and each frame is sent to meow meow scratch. Press **Ctrl+C** to stop — it will tell you how many frames were sent.
+Point the sensor at something — your hand, a cup of tea, a wall — and watch the GlowBit light up with a thermal colour gradient. Press **Ctrl+C** to stop.
+
+## Configuration
+
+All settings are at the top of `thermal_camera.py`:
+
+| Setting | Default | Description |
+|---|---|---|
+| `API_DISABLED` | `True` | Set to `False` to send frames to meow meow scratch |
+| `TEMP_MIN` | `20.0` | Temperature (°C) that maps to blue / black |
+| `TEMP_MAX` | `35.0` | Temperature (°C) that maps to red / white |
+| `AMG_ADDRESS` | `0x69` | I2C address of the AMG8833 (some boards use `0x68`) |
+| `SEND_INTERVAL` | `0.1` | Seconds between readings (0.1 = ~10 fps) |
+| `GLOWBIT_PIN` | `18` | GPIO pin connected to the GlowBit DIN |
+| `GLOWBIT_BRIGHTNESS` | `40` | LED brightness (0–255) |
+| `ROTATION` | `0` | Rotate the display 0/1/2/3 × 90° clockwise |
+| `FLIP_VERTICAL` | `False` | Flip the display top-to-bottom |
+| `FLIP_HORIZONTAL` | `True` | Flip the display left-to-right |
+
+## Display modes
+
+The script auto-detects what's connected and uses the best available display:
+
+| Priority | Display | What it looks like |
+|---|---|---|
+| 1 | **GlowBit 8x8** | Full-colour thermal heat map (blue→cyan→green→yellow→red) |
+| 2 | **1.3" OLED** | Greyscale heat map with Hi/Lo/Ctr temperature stats |
+| 3 | **Terminal** | ASCII heat map using shade characters (space→`@`) |
+
+Multiple displays can run at the same time — e.g. GlowBit + OLED together.
 
 ## What gets sent to meow meow scratch
 
-Each frame is a JSON object with:
+When `API_DISABLED = False`, each frame is sent as a JSON object:
 
 | Field | Type | Description |
 |---|---|---|
@@ -145,28 +204,30 @@ The `pixels_8bit` field is designed for direct use as input to an 8-bit neural n
 
 ## How the code works
 
-1. **Connect to the API** — authenticates with meow meow scratch using your API key.
+1. **Load config** — reads the API key from `.env` and connects to meow meow scratch (if enabled).
 2. **Set up I2C** — opens the two-wire I2C bus on the Pi.
 3. **Initialise the AMG8833** — connects to the thermal sensor at its I2C address.
-4. **Try to initialise the OLED** — if the display is connected and the libraries are installed, it sets up the screen. Otherwise it switches to terminal mode.
-5. **Main loop** (runs every second):
+4. **Initialise displays** — tries GlowBit (GPIO 18), then OLED (I2C 0x3C), falls back to terminal.
+5. **Main loop** (runs ~10 times per second):
    - Reads 64 temperature values (an 8x8 grid) from the sensor.
    - Builds a frame with raw temps, 8-bit values, and summary stats.
-   - Sends the frame to meow meow scratch.
-   - Updates the local display (OLED or terminal).
-6. **Clean exit** — when you press Ctrl+C, it reports how many frames were sent.
+   - Sends the frame to meow meow scratch (if API enabled).
+   - Applies rotation and flip settings to the grid.
+   - Maps each temperature to a colour and updates the display.
+6. **Clean exit** — when you press Ctrl+C, LEDs are turned off and it reports how many frames were sent.
 
 ## Troubleshooting
 
 | Problem | Likely cause | Fix |
 |---|---|---|
-| `No I2C device at address: 0x69` | Sensor not wired correctly or I2C not enabled | Check wiring and run `sudo raspi-config` to enable I2C |
-| `No I2C device at address: 0x3c` | OLED not wired correctly | Check the four wires — or just skip the OLED |
-| OLED stays blank but no errors | Wrong display driver | Change `sh1106` to `ssd1306` in `thermal_camera.py` |
-| `Send failed: ...` | API key wrong or app/endpoint not created | Check `MEOW_API_KEY` and create the app on meowmeowscratch.com |
-| Heat map is all black | Temperature range too high for the scene | Lower `TEMP_MAX` (e.g. to 30) |
-| Heat map is all white | Temperature range too low | Raise `TEMP_MAX` |
+| `No I2C device at address: 0x69` | Sensor not wired or I2C not enabled | Check wiring and run `sudo raspi-config` to enable I2C |
+| GlowBit shows nothing | Not running as root | Run with `sudo venv/bin/python3 thermal_camera.py` |
+| GlowBit shows only 1 LED | Data wire on wrong pad, or bad solder | Check DIN (not DOUT), check 5V power, resolder headers |
+| GlowBit shows wrong colours | Pixel order mismatch | The `glowbit` library handles this — make sure it's installed |
+| `Send failed: ...` | API key wrong or app not created | Check `MEOW_API_KEY` in `.env` and create the app on meowmeowscratch.com |
+| Heat map looks mirrored | Sensor/display orientation | Adjust `FLIP_VERTICAL`, `FLIP_HORIZONTAL`, or `ROTATION` in config |
+| Heat map is all one colour | Temperature range doesn't match the scene | Narrow `TEMP_MIN`/`TEMP_MAX` to match (e.g. 24–32 for indoors) |
 | `ModuleNotFoundError: No module named 'RPi'` | RPi.GPIO not installed | Run `pip install RPi.GPIO` |
+| `ModuleNotFoundError: No module named '_rpi_ws281x'` | WS281x driver missing | Run `pip install rpi_ws281x` |
 | `libopenblas.so.0: cannot open shared object file` | System library missing | Run `sudo apt install -y libopenblas0` |
-| `i2cdetect` shows nothing | I2C not enabled or bad wiring | Re-run `raspi-config`, check wires |
-| Image is upside down | Sensor or display is rotated | Add `device.rotate(2)` after the `device = sh1106(...)` line |
+| OLED stays blank | Wrong display driver | Change `sh1106` to `ssd1306` in the code |

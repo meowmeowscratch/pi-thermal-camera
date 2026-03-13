@@ -31,16 +31,19 @@ try:
 except ImportError:
     OLED_AVAILABLE = False
 
+# GlowBit library for the 8x8 LED matrix.
+try:
+    import glowbit                 # Core Electronics GlowBit matrix driver
+    GLOWBIT_AVAILABLE = True
+except ImportError:
+    GLOWBIT_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Configuration — tweak these to suit your environment
 # ---------------------------------------------------------------------------
 
 # meow meow scratch settings
-API_KEY = os.environ.get("MEOW_API_KEY")
-if not API_KEY:
-    print("Set MEOW_API_KEY in your .env file or as an environment variable.")
-    print('  echo \'MEOW_API_KEY=your-key-here\' >> .env')
-    sys.exit(1)
+API_KEY = os.environ.get("MEOW_API_KEY", "")
 
 APP = "heat"                       # Name of your app on meow meow scratch
 ENDPOINT = "thermal"               # Endpoint where frames are stored
@@ -56,9 +59,13 @@ TEMP_MAX = 35.0
 # to see which address your sensor is using.
 AMG_ADDRESS = 0x69
 
+# Set to True to skip sending data to the API.
+# Useful for testing the sensor and display without network delays.
+API_DISABLED = True
+
 # How often to read and send a frame (in seconds).
 # 1 second gives good coverage without flooding the API.
-SEND_INTERVAL = 1.0
+SEND_INTERVAL = 0.1
 
 # OLED display dimensions (128x64 is standard for the 1.3" Duinotech OLED)
 OLED_WIDTH = 128
@@ -66,6 +73,21 @@ OLED_HEIGHT = 64
 
 # Size in pixels of the heat-map square drawn on the OLED.
 HEATMAP_SIZE = 56
+
+# GlowBit 8x8 LED matrix settings
+GLOWBIT_PIN = 18                  # GPIO 18 — data pin for the LED matrix
+GLOWBIT_BRIGHTNESS = 40           # 0–255, keep low to avoid blinding yourself
+
+# Display orientation — how many times to rotate the 8x8 grid 90° clockwise.
+#   0 = no rotation
+#   1 = 90° clockwise
+#   2 = 180° (upside down)
+#   3 = 270° clockwise (90° counter-clockwise)
+ROTATION = 0
+
+# Flip the display vertically (top↔bottom) or horizontally (left↔right).
+FLIP_VERTICAL = False
+FLIP_HORIZONTAL = True
 
 # Characters used to represent temperature in the terminal heat map,
 # ordered from coldest to hottest.
@@ -75,6 +97,21 @@ SHADE_CHARS = " .-:=+*#%@"
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
+def orient_grid(pixels):
+    """
+    Apply rotation and flip settings to the 8x8 grid for display.
+    Rotation is clockwise in 90° steps.  Flips mirror the grid.
+    """
+    arr = np.array(pixels)
+    if ROTATION:
+        arr = np.rot90(arr, k=-ROTATION)
+    if FLIP_VERTICAL:
+        arr = np.flipud(arr)
+    if FLIP_HORIZONTAL:
+        arr = np.fliplr(arr)
+    return arr.tolist()
+
 
 def pixels_to_8bit(pixels):
     """
@@ -156,6 +193,73 @@ def setup_endpoint(api):
             )
         except MeowError:
             pass  # Already exists
+
+
+def temp_to_rgb(temp):
+    """
+    Map a temperature value to an RGB colour using a thermal camera
+    gradient:  blue → cyan → green → yellow → red.
+
+    The gradient is split into 4 equal segments across the TEMP_MIN to
+    TEMP_MAX range.  Each segment blends between two colours by ramping
+    one channel up or down.
+    """
+    # Normalise temperature to 0.0–1.0
+    ratio = (temp - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)
+    ratio = max(0.0, min(1.0, ratio))
+
+    # Scale to 0–4 to pick which colour segment we're in
+    segment = ratio * 4.0
+
+    if segment <= 1.0:
+        # Blue → Cyan:  red stays 0, green ramps up, blue stays 255
+        r, g, b = 0, int(segment * 255), 255
+    elif segment <= 2.0:
+        # Cyan → Green:  red stays 0, green stays 255, blue ramps down
+        r, g, b = 0, 255, int((2.0 - segment) * 255)
+    elif segment <= 3.0:
+        # Green → Yellow:  red ramps up, green stays 255, blue stays 0
+        r, g, b = int((segment - 2.0) * 255), 255, 0
+    else:
+        # Yellow → Red:  red stays 255, green ramps down, blue stays 0
+        r, g, b = 255, int((4.0 - segment) * 255), 0
+
+    return (r, g, b)
+
+
+def setup_glowbit():
+    """
+    Try to initialise the GlowBit 8x8 LED matrix.
+    Returns the matrix object, or None if not available.
+    Must be run as root (sudo) because WS2812B LEDs need hardware PWM.
+    """
+    if not GLOWBIT_AVAILABLE:
+        return None
+
+    try:
+        matrix = glowbit.matrix8x8(pin=GLOWBIT_PIN, brightness=GLOWBIT_BRIGHTNESS)
+        matrix.pixelsFill(0)
+        matrix.pixelsShow()
+        return matrix
+    except Exception as e:
+        print(f"GlowBit not available ({e}) — try running with sudo.")
+        return None
+
+
+def display_on_glowbit(matrix, pixels):
+    """
+    Map the 8x8 temperature grid directly onto the 8x8 LED matrix.
+    Each LED gets a colour from the thermal gradient (blue=cold, red=hot).
+    The glowbit library handles the pixel layout internally via pixelSetXY.
+    """
+    for row_idx, row in enumerate(pixels):
+        for col_idx, temp in enumerate(row):
+            r, g, b = temp_to_rgb(temp)
+            # Pack RGB into the 24-bit integer format glowbit expects
+            colour = (r << 16) | (g << 8) | b
+            matrix.pixelSetXY(col_idx, row_idx, colour)
+
+    matrix.pixelsShow()
 
 
 def print_terminal_heatmap(pixels, temp_min, temp_max, temp_centre):
@@ -240,8 +344,15 @@ def display_on_oled(device, font, pixels, temp_min, temp_max, temp_centre):
 
 def main():
     # --- API setup ---
-    api = Meow(api_key=API_KEY)
-    setup_endpoint(api)
+    if not API_DISABLED and API_KEY:
+        api = Meow(api_key=API_KEY)
+        setup_endpoint(api)
+    else:
+        api = None
+        if API_DISABLED:
+            print("API disabled — running in local-only mode.")
+        else:
+            print("No MEOW_API_KEY set — running in local-only mode.")
 
     # --- Sensor setup ---
     # I2C ("Inter-Integrated Circuit") is a two-wire protocol that lets
@@ -255,12 +366,15 @@ def main():
     sensor = adafruit_amg88xx.AMG88XX(i2c_bus, addr=AMG_ADDRESS)
 
     # --- Display setup (optional) ---
+    strip = setup_glowbit()
     device, font = setup_oled()
     use_oled = device is not None
 
+    if strip:
+        print("Thermal camera running (GlowBit) — press Ctrl+C to stop.")
     if use_oled:
         print("Thermal camera running (OLED) — press Ctrl+C to stop.")
-    else:
+    if not strip and not use_oled:
         print("Thermal camera running (terminal) — press Ctrl+C to stop.")
         print(f"Display range: {TEMP_MIN} C (space) to {TEMP_MAX} C (@)")
         # Print blank lines so the first frame has something to overwrite
@@ -282,25 +396,37 @@ def main():
             ) / 4.0
 
             # --- Send frame to meow meow scratch ---
-            frame = build_frame(pixels)
-            try:
-                api.send(APP, ENDPOINT, frame)
-                frame_count += 1
-            except MeowError as e:
-                print(f"Send failed: {e}")
+            if api:
+                frame = build_frame(pixels)
+                try:
+                    api.send(APP, ENDPOINT, frame)
+                    frame_count += 1
+                except MeowError as e:
+                    print(f"Send failed: {e}")
 
-            # --- Update local display ---
+            # Rotate the grid for display (doesn't affect the raw data sent to API)
+            display_pixels = orient_grid(pixels)
+
+            # --- Update local displays ---
+            if strip:
+                display_on_glowbit(strip, display_pixels)
             if use_oled:
-                display_on_oled(device, font, pixels, temp_min, temp_max, temp_centre)
-            else:
-                print_terminal_heatmap(pixels, temp_min, temp_max, temp_centre)
+                display_on_oled(device, font, display_pixels, temp_min, temp_max, temp_centre)
+            if not strip and not use_oled:
+                print_terminal_heatmap(display_pixels, temp_min, temp_max, temp_centre)
 
             time.sleep(SEND_INTERVAL)
 
     except KeyboardInterrupt:
+        if strip:
+            strip.pixelsFill(0)
+            strip.pixelsShow()
         if use_oled:
             device.hide()
-        print(f"\nStopped. Sent {frame_count} frames to {APP}/{ENDPOINT}.")
+        if api:
+            print(f"\nStopped. Sent {frame_count} frames to {APP}/{ENDPOINT}.")
+        else:
+            print("\nStopped.")
 
 
 if __name__ == "__main__":

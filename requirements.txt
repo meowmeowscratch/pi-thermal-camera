@@ -1,0 +1,7 @@
+meow-sdk
+python-dotenv
+RPi.GPIO
+adafruit-circuitpython-amg88xx
+luma.oled
+Pillow
+numpy

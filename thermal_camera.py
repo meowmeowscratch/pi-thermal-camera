@@ -11,6 +11,7 @@ import os                          # Access environment variables (API key)
 import sys                         # Exit cleanly on missing config
 import time                        # Timing control for the refresh loop
 from dotenv import load_dotenv     # Load variables from .env file
+import RPi.GPIO as GPIO            # Raspberry Pi GPIO control (for HC-SR04 distance sensor)
 
 # Read the .env file in the same directory as this script, so you
 # don't have to export variables in your shell every time.
@@ -54,6 +55,20 @@ ENDPOINT = "thermal"               # Endpoint where frames are stored
 TEMP_MIN = 20.0
 TEMP_MAX = 35.0
 
+# Auto-range mode — when True, the display ignores TEMP_MIN/TEMP_MAX and
+# instead stretches contrast to the actual min/max of each frame.  This
+# maximises sensitivity so that even tiny temperature differences (like a
+# person at 7 metres who is only ~1 C warmer than the background) fill the
+# entire colour range.  Think "predator vision."
+AUTO_RANGE = True
+
+# When AUTO_RANGE is on, the frame's temperature span can be very small
+# (e.g. 0.3 C), which amplifies sensor noise.  AUTO_RANGE_MIN_SPAN sets
+# the minimum span in degrees — if the real span is smaller, it gets
+# expanded evenly around the midpoint.  2.0 C is a good starting point;
+# lower it for even more sensitivity, raise it to reduce flicker.
+AUTO_RANGE_MIN_SPAN = 2.0
+
 # AMG8833 I2C address.  The default is 0x69.  If you connect the sensor's
 # address pin to ground, it changes to 0x68.  Run "sudo i2cdetect -y 1"
 # to see which address your sensor is using.
@@ -89,6 +104,15 @@ ROTATION = 0
 FLIP_VERTICAL = False
 FLIP_HORIZONTAL = True
 
+# HC-SR04 ultrasonic distance sensor.
+# The sensor sends a burst of ultrasound and measures how long the echo
+# takes to return.  TRIG sends the burst, ECHO receives the return pulse.
+# Set DISTANCE_ENABLED = False if no HC-SR04 is connected.
+DISTANCE_ENABLED = True
+TRIG_PIN = 23                     # GPIO 23 — trigger pin (output)
+ECHO_PIN = 25                     # GPIO 25 — echo pin (input)
+DISTANCE_TIMEOUT = 0.04           # Max wait for echo (seconds) — ~7 m range
+
 # Characters used to represent temperature in the terminal heat map,
 # ordered from coldest to hottest.
 SHADE_CHARS = " .-:=+*#%@"
@@ -97,6 +121,31 @@ SHADE_CHARS = " .-:=+*#%@"
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
+def effective_range(pixels):
+    """
+    Return the (low, high) temperature range to use for display mapping.
+
+    In auto-range mode this is derived from the actual pixel values in the
+    current frame, clamped to at least AUTO_RANGE_MIN_SPAN degrees so that
+    sensor noise doesn't cause wild flicker.  In fixed mode it simply
+    returns (TEMP_MIN, TEMP_MAX).
+    """
+    if not AUTO_RANGE:
+        return TEMP_MIN, TEMP_MAX
+
+    flat = [t for row in pixels for t in row]
+    lo, hi = min(flat), max(flat)
+    span = hi - lo
+
+    if span < AUTO_RANGE_MIN_SPAN:
+        # Centre the minimum span around the midpoint of the actual data
+        mid = (lo + hi) / 2.0
+        lo = mid - AUTO_RANGE_MIN_SPAN / 2.0
+        hi = mid + AUTO_RANGE_MIN_SPAN / 2.0
+
+    return lo, hi
+
 
 def orient_grid(pixels):
     """
@@ -183,6 +232,7 @@ def setup_endpoint(api):
         ("temp_max",    "Max Temperature",     "number", "Hottest pixel in the frame"),
         ("temp_centre", "Centre Temperature",  "number", "Average of the 4 centre pixels"),
         ("temp_range",  "Temperature Range",   "json",   "Min/max C used for 8-bit mapping"),
+        ("distance_cm", "Distance",            "number", "HC-SR04 ultrasonic distance in cm"),
     ]
 
     for name, label, field_type, help_text in fields:
@@ -195,17 +245,28 @@ def setup_endpoint(api):
             pass  # Already exists
 
 
-def temp_to_rgb(temp):
+def temp_to_rgb(temp, t_min=None, t_max=None):
     """
     Map a temperature value to an RGB colour using a thermal camera
     gradient:  blue → cyan → green → yellow → red.
 
-    The gradient is split into 4 equal segments across the TEMP_MIN to
-    TEMP_MAX range.  Each segment blends between two colours by ramping
+    The gradient is split into 4 equal segments across the t_min to
+    t_max range.  Each segment blends between two colours by ramping
     one channel up or down.
+
+    If t_min/t_max are not provided, falls back to the global
+    TEMP_MIN/TEMP_MAX constants (used by the API 8-bit conversion).
     """
+    if t_min is None:
+        t_min = TEMP_MIN
+    if t_max is None:
+        t_max = TEMP_MAX
+
     # Normalise temperature to 0.0–1.0
-    ratio = (temp - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)
+    span = t_max - t_min
+    if span <= 0:
+        span = 1.0
+    ratio = (temp - t_min) / span
     ratio = max(0.0, min(1.0, ratio))
 
     # Scale to 0–4 to pick which colour segment we're in
@@ -227,6 +288,73 @@ def temp_to_rgb(temp):
     return (r, g, b)
 
 
+def setup_distance_sensor():
+    """
+    Set up the HC-SR04 ultrasonic distance sensor GPIO pins.
+
+    The HC-SR04 works by sending a short ultrasound pulse from the TRIG pin,
+    then listening on the ECHO pin.  The ECHO pin goes HIGH for a duration
+    proportional to the distance the sound travelled.  We time that pulse
+    and convert it to centimetres using the speed of sound.
+    """
+    if not DISTANCE_ENABLED:
+        return False
+
+    # BCM mode means we refer to pins by their Broadcom GPIO number
+    # (the numbers in the "GPIO xx" column), not the physical pin number.
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(TRIG_PIN, GPIO.OUT)
+    GPIO.setup(ECHO_PIN, GPIO.IN)
+    # Make sure trigger starts LOW
+    GPIO.output(TRIG_PIN, False)
+    time.sleep(0.05)
+    return True
+
+
+def read_distance_cm():
+    """
+    Take a single distance measurement from the HC-SR04.
+
+    Returns the distance in centimetres, or None if the measurement
+    timed out (nothing in range, or sensor not responding).
+
+    How it works:
+      1. Send a 10 µs HIGH pulse on TRIG — this tells the sensor to fire.
+      2. The sensor sends 8 ultrasound pulses at 40 kHz.
+      3. The ECHO pin goes HIGH when the sound leaves and stays HIGH until
+         the echo returns.
+      4. Distance = (echo_duration * speed_of_sound) / 2
+         Speed of sound ≈ 34300 cm/s at room temperature.
+         We divide by 2 because the sound travels there and back.
+    """
+    # Fire the trigger pulse (10 µs)
+    GPIO.output(TRIG_PIN, True)
+    time.sleep(0.00001)
+    GPIO.output(TRIG_PIN, False)
+
+    # Wait for the ECHO pin to go HIGH (start of return pulse)
+    start = time.time()
+    timeout = start + DISTANCE_TIMEOUT
+    while GPIO.input(ECHO_PIN) == 0:
+        start = time.time()
+        if start > timeout:
+            return None
+
+    # Wait for the ECHO pin to go LOW (end of return pulse)
+    end = start
+    while GPIO.input(ECHO_PIN) == 1:
+        end = time.time()
+        if end > timeout:
+            return None
+
+    # Convert the pulse duration to distance
+    # Speed of sound = 34300 cm/s, divide by 2 for the round trip
+    distance_cm = (end - start) * 34300 / 2.0
+
+    return round(distance_cm, 1)
+
+
 def setup_glowbit():
     """
     Try to initialise the GlowBit 8x8 LED matrix.
@@ -246,7 +374,7 @@ def setup_glowbit():
         return None
 
 
-def display_on_glowbit(matrix, pixels):
+def display_on_glowbit(matrix, pixels, t_min, t_max):
     """
     Map the 8x8 temperature grid directly onto the 8x8 LED matrix.
     Each LED gets a colour from the thermal gradient (blue=cold, red=hot).
@@ -254,7 +382,7 @@ def display_on_glowbit(matrix, pixels):
     """
     for row_idx, row in enumerate(pixels):
         for col_idx, temp in enumerate(row):
-            r, g, b = temp_to_rgb(temp)
+            r, g, b = temp_to_rgb(temp, t_min, t_max)
             # Pack RGB into the 24-bit integer format glowbit expects
             colour = (r << 16) | (g << 8) | b
             matrix.pixelSetXY(col_idx, row_idx, colour)
@@ -262,26 +390,35 @@ def display_on_glowbit(matrix, pixels):
     matrix.pixelsShow()
 
 
-def print_terminal_heatmap(pixels, temp_min, temp_max, temp_centre):
+def print_terminal_heatmap(pixels, temp_min, temp_max, temp_centre, t_min, t_max, distance_cm=None):
     """
     Print an ASCII heat map to the terminal.  Each temperature value is
     mapped to a shade character — spaces for cold, @ for hot.
+    t_min/t_max are the effective display range (auto or fixed).
     """
-    # Move cursor up to overwrite the previous frame (8 data rows + 4 info lines)
-    print("\033[12A", end="")
+    # Move cursor up to overwrite the previous frame (8 data rows + 5 info lines)
+    print("\033[13A", end="")
+
+    span = t_max - t_min
+    if span <= 0:
+        span = 1.0
 
     for row in pixels:
         line = ""
         for temp in row:
-            ratio = (temp - TEMP_MIN) / (TEMP_MAX - TEMP_MIN)
+            ratio = (temp - t_min) / span
             ratio = max(0.0, min(1.0, ratio))
             idx = int(ratio * (len(SHADE_CHARS) - 1))
             line += SHADE_CHARS[idx] * 2
         print(line)
 
     print(f"  Hi {temp_max:.1f} C | Lo {temp_min:.1f} C | Ctr {temp_centre:.1f} C")
-    print(f"  Range: {TEMP_MIN} C (space) to {TEMP_MAX} C (@)")
-    print()
+    print(f"  Range: {t_min:.1f} C (space) to {t_max:.1f} C (@)")
+    if distance_cm is not None:
+        dist_m = distance_cm / 100.0
+        print(f"  Distance: {dist_m:.2f} m ({distance_cm:.0f} cm)       ")
+    else:
+        print(f"  Distance: --                          ")
     print()
 
 
@@ -310,11 +447,14 @@ def setup_oled():
     return device, font
 
 
-def display_on_oled(device, font, pixels, temp_min, temp_max, temp_centre):
+def display_on_oled(device, font, pixels, temp_min, temp_max, temp_centre, t_min, t_max, distance_cm=None):
     """Render the heat map and temperature stats on the OLED screen."""
     arr = np.array(pixels, dtype=np.float32)
-    arr = np.clip(arr, TEMP_MIN, TEMP_MAX)
-    arr = ((arr - TEMP_MIN) / (TEMP_MAX - TEMP_MIN) * 255).astype(np.uint8)
+    arr = np.clip(arr, t_min, t_max)
+    span = t_max - t_min
+    if span <= 0:
+        span = 1.0
+    arr = ((arr - t_min) / span * 255).astype(np.uint8)
     img = Image.fromarray(arr, mode="L")
     heatmap = img.resize((HEATMAP_SIZE, HEATMAP_SIZE), Image.BILINEAR)
 
@@ -330,10 +470,12 @@ def display_on_oled(device, font, pixels, temp_min, temp_max, temp_centre):
     )
 
     text_x = HEATMAP_SIZE + 8
-    draw.text((text_x, 4),  f"Hi {temp_max:.1f}", fill=255, font=font)
-    draw.text((text_x, 18), f"Lo {temp_min:.1f}", fill=255, font=font)
-    draw.text((text_x, 36), "Ctr",               fill=255, font=font)
-    draw.text((text_x, 48), f"{temp_centre:.1f}C", fill=255, font=font)
+    draw.text((text_x, 2),  f"Hi {temp_max:.1f}", fill=255, font=font)
+    draw.text((text_x, 14), f"Lo {temp_min:.1f}", fill=255, font=font)
+    draw.text((text_x, 28), f"Ctr",               fill=255, font=font)
+    draw.text((text_x, 38), f"{temp_centre:.1f}C", fill=255, font=font)
+    if distance_cm is not None:
+        draw.text((text_x, 52), f"{distance_cm / 100:.1f}m", fill=255, font=font)
 
     device.display(canvas)
 
@@ -370,6 +512,11 @@ def main():
     device, font = setup_oled()
     use_oled = device is not None
 
+    # --- Distance sensor setup (optional) ---
+    has_distance = setup_distance_sensor()
+    if has_distance:
+        print("HC-SR04 distance sensor enabled.")
+
     if strip:
         print("Thermal camera running (GlowBit) — press Ctrl+C to stop.")
     if use_oled:
@@ -378,7 +525,7 @@ def main():
         print("Thermal camera running (terminal) — press Ctrl+C to stop.")
         print(f"Display range: {TEMP_MIN} C (space) to {TEMP_MAX} C (@)")
         # Print blank lines so the first frame has something to overwrite
-        print("\n" * 11, end="")
+        print("\n" * 12, end="")
 
     frame_count = 0
 
@@ -386,6 +533,9 @@ def main():
         while True:
             # Read the 8x8 grid of temperatures (each value is a float in C)
             pixels = sensor.pixels
+
+            # Read distance from HC-SR04 (if connected)
+            distance_cm = read_distance_cm() if has_distance else None
 
             # Calculate summary stats
             flat = [temp for row in pixels for temp in row]
@@ -398,6 +548,8 @@ def main():
             # --- Send frame to meow meow scratch ---
             if api:
                 frame = build_frame(pixels)
+                if distance_cm is not None:
+                    frame["distance_cm"] = distance_cm
                 try:
                     api.send(APP, ENDPOINT, frame)
                     frame_count += 1
@@ -407,13 +559,25 @@ def main():
             # Rotate the grid for display (doesn't affect the raw data sent to API)
             display_pixels = orient_grid(pixels)
 
+            # Compute the effective temperature range for display mapping.
+            # In auto-range mode this stretches contrast to the frame's own
+            # min/max — critical for spotting a warm body against a cool
+            # background at distance (the "predator vision" effect).
+            t_lo, t_hi = effective_range(display_pixels)
+
             # --- Update local displays ---
             if strip:
-                display_on_glowbit(strip, display_pixels)
+                display_on_glowbit(strip, display_pixels, t_lo, t_hi)
             if use_oled:
-                display_on_oled(device, font, display_pixels, temp_min, temp_max, temp_centre)
+                display_on_oled(device, font, display_pixels, temp_min, temp_max, temp_centre, t_lo, t_hi, distance_cm)
             if not strip and not use_oled:
-                print_terminal_heatmap(display_pixels, temp_min, temp_max, temp_centre)
+                print_terminal_heatmap(display_pixels, temp_min, temp_max, temp_centre, t_lo, t_hi, distance_cm)
+
+            # Always print a one-line status to the terminal so you can
+            # see live readings even when GlowBit or OLED is the main display.
+            if strip or use_oled:
+                dist_str = f"{distance_cm / 100:.2f}m" if distance_cm is not None else "--"
+                print(f"\r  Hi {temp_max:.1f} | Lo {temp_min:.1f} | Ctr {temp_centre:.1f} | Dist {dist_str}    ", end="", flush=True)
 
             time.sleep(SEND_INTERVAL)
 
@@ -423,6 +587,8 @@ def main():
             strip.pixelsShow()
         if use_oled:
             device.hide()
+        if has_distance:
+            GPIO.cleanup()
         if api:
             print(f"\nStopped. Sent {frame_count} frames to {APP}/{ENDPOINT}.")
         else:

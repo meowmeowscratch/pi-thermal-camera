@@ -1,4 +1,4 @@
-meow-sdk
+meow-sdk>=0.7,<0.8
 python-dotenv
 RPi.GPIO
 adafruit-circuitpython-amg88xx

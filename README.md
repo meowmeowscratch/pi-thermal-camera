@@ -172,6 +172,8 @@ echo 'MEOW_API_KEY=paste-your-key-here' >> .env
 
 The script uses `python-dotenv` to read this file automatically when it starts.
 
+> **Which kind of key should you use?** Your account offers two. A **platform token** works across every app you own. An **app API key** works for one app only. For a Pi that sits running for days, use an **app API key** — if it ever leaks, only this one app is affected, not your whole account. You'll find both in your account settings.
+
 ### 6. Create your app on meow meow scratch
 
 1. Log in to **meowmeowscratch.com**.

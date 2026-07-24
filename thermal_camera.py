@@ -20,7 +20,10 @@ import board                       # Raspberry Pi pin definitions (from Adafruit
 import busio                       # I2C communication support
 import adafruit_amg88xx            # Driver for the AMG8833 8x8 infrared thermal sensor
 import numpy as np                 # Numerical operations for temperature processing
-from meow_sdk import Meow, MeowError  # Client for the meow meow scratch API
+# Client for the meow meow scratch API. AuthError and RateLimitError are more
+# specific kinds of MeowError, letting us distinguish a rejected key from
+# simply sending frames faster than the plan allows.
+from meow_sdk import Meow, MeowError, AuthError, RateLimitError
 
 # These imports are only needed when an OLED is connected.
 # They are loaded here so the script still works without them.
@@ -221,6 +224,14 @@ def setup_endpoint(api):
             is_public=True,
         )
         print(f"Created endpoint: {APP}/{ENDPOINT}")
+    except AuthError as e:
+        # Catch this BEFORE the general "already exists" case below. A bad key
+        # also makes this call fail, and silently continuing would hide the real
+        # problem until the first frame failed to send.
+        print(f"API key rejected: {e}")
+        if e.hint:
+            print(f"Hint: {e.hint}")
+        sys.exit(1)
     except MeowError:
         pass  # Already exists
 
@@ -241,6 +252,12 @@ def setup_endpoint(api):
                 APP, ENDPOINT, name, label, field_type,
                 help_text=help_text,
             )
+        except AuthError as e:
+            # As above: a rejected key must not be mistaken for "field exists".
+            print(f"API key rejected: {e}")
+            if e.hint:
+                print(f"Hint: {e.hint}")
+            sys.exit(1)
         except MeowError:
             pass  # Already exists
 
@@ -553,8 +570,23 @@ def main():
                 try:
                     api.send(APP, ENDPOINT, frame)
                     frame_count += 1
+                except AuthError as e:
+                    # A rejected key won't fix itself, and this loop runs many
+                    # times a second -- stop rather than flooding the terminal.
+                    print(f"API key rejected: {e}")
+                    if e.hint:
+                        print(f"Hint: {e.hint}")
+                    sys.exit(1)
+                except RateLimitError as e:
+                    # Thermal frames are sent frequently, so this is the most
+                    # likely error here. Drop the frame and carry on -- the
+                    # next one is only milliseconds away.
+                    print(f"Rate limited (frame dropped): {e}")
                 except MeowError as e:
                     print(f"Send failed: {e}")
+                    # .hint is a plain-English fix from the API, when it has one.
+                    if e.hint:
+                        print(f"Hint: {e.hint}")
 
             # Rotate the grid for display (doesn't affect the raw data sent to API)
             display_pixels = orient_grid(pixels)
